@@ -1,0 +1,78 @@
+api_key: "718212ec7e0efd4537d22eb6c0a33033"
+bankroll: 2500.0
+kelly_fraction: 0.18
+max_stake_pct: 0.02
+min_price: 1.45
+min_price_beat: 0.04
+max_price_beat: 0.20
+max_book_overround: 0.10
+min_sharp_books: 1
+drawdown_guard: 0.15
+max_pick_age_min: 35
+daily_cap: 2
+max_per_league: 1
+max_per_book: 2
+max_per_sport: 1
+regions: "eu,us"
+markets: "h2h,spreads,totals"
+event_markets: "h2h,spreads,totals"
+max_credits_per_run: 600
+scan_lead_minutes: 180
+rescan_cooldown: 45
+test_window_hours: 48
+test_max_events: 50
+credit_floor: 1000
+staking_mode: flat
+flat_pct: 0.01
+
+
+sharp_books: ["pinnacle", "lowvig", "betonlineag", "betfair_ex_eu", "matchbook", "betanysports"]
+semi_sharp_books: ["coolbet", "nordicbet", "betsson", "unibet_se", "leovegas_se", "unibet_nl", "unibet_fr", "marathonbet", "williamhill", "betrivers"]
+semi_sharp_factor: 1.6
+exclude_markets: ["h2h_lay"]
+
+telegram_token: "9218142827:AAGI-Mi1FRzo_FLMJxytvTJvXfZcpokGYUI"
+telegram_chat: "5696929462"
+
+props_by_sport:
+  basketball_nba: "player_points,player_rebounds,player_assists"
+  icehockey_nhl: "player_goals"
+
+soft_leagues:
+  - soccer_efl_champ
+  - soccer_england_league1
+  - soccer_england_league2
+  - soccer_germany_bundesliga2
+  - soccer_germany_liga3
+  - soccer_italy_serie_b
+  - soccer_spain_segunda_division
+  - soccer_france_ligue_two
+  - soccer_brazil_serie_b
+  - soccer_argentina_primera_division
+  - soccer_sweden_allsvenskan
+  - soccer_sweden_superettan
+  - soccer_denmark_superliga
+  - soccer_poland_ekstraklasa
+  - soccer_turkey_super_league
+  - soccer_greece_super_league
+  - soccer_portugal_primeira_liga
+  - basketball_euroleague
+  - basketball_ncaab
+  - basketball_wcba
+  - icehockey_liiga
+  - icehockey_sweden_hockey_league
+
+watchlist:
+  - soccer_germany_bundesliga_women
+  - soccer_uefa_champs_league_women
+  - soccer_australia_aleague
+  - soccer_austria_bundesliga
+  - soccer_belgium_first_div
+  - soccer_chile_campeonato
+  - soccer_russia_premier_league
+  - soccer_switzerland_superleague
+  - soccer_spl
+  - basketball_nbl
+  - icehockey_sweden_allsvenskan
+  - icehockey_mestis
+  - icehockey_ahl
