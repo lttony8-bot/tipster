@@ -1,4 +1,5 @@
 import sqlite3, os
+import time 
 
 DB = os.path.join(os.path.dirname(__file__), "tipster.db")
 
@@ -31,3 +32,19 @@ def init():
         for col in ("clv", "closing_price"):
             if col not in cols:
                 c.execute(f"ALTER TABLE picks ADD COLUMN {col} REAL")
+
+def clean_garbage():
+    """Borra el historial de cuotas de más de 3 días para que la base de datos sea veloz."""
+    limite = time.time() - 259200 # 3 días en segundos
+    
+    # 1. Primero borramos los datos (dentro de una transacción segura)
+    with conn() as c:
+        n_snaps = c.execute("DELETE FROM snaps WHERE ts < ?", (limite,)).rowcount
+        n_scans = c.execute("DELETE FROM scans WHERE ts < ?", (limite,)).rowcount
+        
+    # 2. Luego liberamos el espacio (fuera de la transacción)
+    conexion = conn()
+    conexion.execute("VACUUM")
+    conexion.close()
+    
+    print(f"Limpieza de DB: {n_snaps} snaps y {n_scans} scans viejos eliminados.")

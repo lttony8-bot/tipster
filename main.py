@@ -24,11 +24,19 @@ def notify(text):
     tok, chat = CFG.get("telegram_token"), CFG.get("telegram_chat")
     if not tok or not chat:
         print(text); return
-    try:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                      data={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=15)
-    except Exception as e:
-        print(f"[tg fallo] {e}\n{text}")
+        
+    for attempt in range(3): # Reintenta 3 veces si Telegram falla
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              data={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=15)
+            if r.status_code == 429: # Si envías muchos mensajes, Telegram te pide esperar
+                time.sleep(5)
+                continue
+            r.raise_for_status()
+            break # Éxito, salir del bucle
+        except Exception as e:
+            print(f"[TG fallo intento {attempt+1}] Esperando red... {e}")
+            time.sleep(3)
 
 def cmd_sports():
     for s in list_sports(CFG["api_key"]):
@@ -55,6 +63,7 @@ def cmd_collect(hours=None, limit=None, quiet=False):
     init()
     now = time.time()
     lim = CFG.get("max_pick_age_min", 25) * 60
+    
     if hours is None:
         hours = CFG["scan_lead_minutes"] / 60
         lo = now + lim
@@ -62,31 +71,49 @@ def cmd_collect(hours=None, limit=None, quiet=False):
     else:
         lo = now + lim
         hi = now + hours * 3600
+        
     with conn() as c:
         rows = c.execute("SELECT id, sport FROM events WHERE commence_ts BETWEEN ? AND ? "
                          "ORDER BY commence_ts LIMIT ?",
                          (lo, hi, limit or 9999)).fetchall()
+                         
+    # Agrupar por deportes para gastar 1 crédito por liga en lugar de 1 por partido
+    sports_to_fetch = list(set(r["sport"] for r in rows))
+    valid_ids = set(r["id"] for r in rows)
+    
     done = fail = 0
-    for r in rows:
+    for sport in sports_to_fetch:
         mk = CFG.get("event_markets", "h2h")
-        extra = CFG.get("props_by_sport", {}).get(r["sport"])
+        extra = CFG.get("props_by_sport", {}).get(sport)
         if extra: mk = f"{mk},{extra}"
-        ev = fetch_event_odds(CFG["api_key"], r["sport"], r["id"], CFG["regions"], mk)
-        if not ev:
-            fail += 1; continue
-        g = group([ev])
+        
+        # AQUÍ ESTÁ LA MAGIA: Pide toda la liga de un solo golpe
+        evs_data, _ = fetch_odds(CFG["api_key"], sport, CFG["regions"], mk)
+        
+        if not evs_data:
+            fail += len([r for r in rows if r["sport"] == sport])
+            continue
+            
+        relevant_evs = [e for e in evs_data if e["id"] in valid_ids]
+        if not relevant_evs: continue
+        
+        g = group(relevant_evs)
         with conn() as c:
-            for m, books in g[r["id"]].items():
-                for bk, outs in books.items():
-                    for oc, pr in outs.items():
-                        c.execute("INSERT INTO snaps(event_id,market,book,outcome,price,ts) "
-                                  "VALUES (?,?,?,?,?,?)", (r["id"], m, bk, oc, pr, time.time()))
-            c.execute("INSERT INTO scans(event_id, ts) VALUES (?,?)", (r["id"], time.time()))
-        done += 1
+            for ev in relevant_evs:
+                eid = ev["id"]
+                if eid not in g: continue
+                for m, books in g[eid].items():
+                    for bk, outs in books.items():
+                        for oc, pr in outs.items():
+                            c.execute("INSERT INTO snaps(event_id,market,book,outcome,price,ts) "
+                                      "VALUES (?,?,?,?,?,?)", (eid, m, bk, oc, pr, time.time()))
+                c.execute("INSERT INTO scans(event_id, ts) VALUES (?,?)", (eid, time.time()))
+                done += 1
+                
     if not quiet:
-        print(f"recolectados {done} · fallidos {fail}")
+        print(f"Recolectados {done} eventos en {len(sports_to_fetch)} ligas · fallidos {fail}")
     if fail:
-        print(f" ultimo error: {LAST['status']} {LAST['body']}")
+        print(f" Último error API: {LAST['status']} {LAST['body']}")
     return done, fail
 
 def cmd_decide(notify_out=True):
@@ -97,6 +124,7 @@ def cmd_decide(notify_out=True):
     now = time.time()
     d0 = datetime.now()
     dia = datetime(d0.year, d0.month, d0.day).timestamp()
+    
     with conn() as c:
         hoy = c.execute("SELECT COUNT(*) n FROM picks WHERE ts >= ?", (dia,)).fetchone()["n"]
     if hoy >= cap:
@@ -118,8 +146,13 @@ def cmd_decide(notify_out=True):
 
     excl = set(CFG.get("exclude_markets", []))
     found = []
+    
     for eid, markets in books.items():
+        if eid not in evs: continue
         sport = evs[eid]["sport"]
+        commence_ts = evs[eid]["commence_ts"]
+        horas_para_partido = (commence_ts - now) / 3600.0
+        
         for mk, bks in markets.items():
             if mk in excl: continue
             pres = SHARPS & set(bks)
@@ -128,19 +161,37 @@ def cmd_decide(notify_out=True):
             outs = sorted(bks[next(iter(pres))].keys())
             if len(outs) < 2: continue
             refset = set(outs)
+            
+            # Devigging puro con Shin
             fp = fair([max(bks[s][o] for s in pres) for o in outs])
             if not fp: continue
             best = {o: max(bks[s][o] for s in pres) for o in outs}
+            
             for bk, pr in bks.items():
                 if bk in SHARPS or set(pr) != refset: continue
                 if overround(list(pr.values())) > CFG.get("max_book_overround", 0.10): continue
-                need = CFG["min_price_beat"] * (CFG.get("semi_sharp_factor", 1.6) if bk in SEMI else 1.0)
+                
+                # --- LÓGICA DE EDGE DINÁMICO POR TIEMPO ---
+                if horas_para_partido > 24:
+                    base_need = 0.06 # Exige 6% si falta más de 1 día (mercado inestable)
+                elif horas_para_partido < 3:
+                    base_need = 0.03 # Exige 3% si falta menos de 3 horas (mercado preciso)
+                else:
+                    base_need = CFG.get("min_price_beat", 0.04) # Exige 4% promedio
+                    
+                need = base_need * (CFG.get("semi_sharp_factor", 1.6) if bk in SEMI else 1.0)
+                # ------------------------------------------
+
                 for oc, price in pr.items():
                     sp = best.get(oc)
-                    if not sp or price < CFG["min_price"]: continue
+                    if not sp or price < CFG.get("min_price", 1.45): continue
+                    
                     edge = price / sp - 1.0
                     if edge < need or edge > CFG.get("max_price_beat", 0.20): continue
-                    p = (fp[outs.index(oc)] + 1.0 / sp) / 2.0
+                    
+                    # Probabilidad real del modelo Shin
+                    p = fp[outs.index(oc)] 
+                    
                     if p >= 1.0: continue
                     found.append({"event": eid, "sport": sport, "market": mk, "outcome": oc,
                                   "book": bk, "price": price, "p": p, "edge": edge})
@@ -157,10 +208,13 @@ def cmd_decide(notify_out=True):
         picked.append(f)
 
     saved = []
-    br = float(state.get("bankroll", CFG["bankroll"]))
+    br = float(state.get("bankroll", CFG.get("bankroll", 2500.0)))
     peak = max(float(state.get("peak", br)), br)
     state.set("peak", peak)
+    
+    # Drawdown Guard: Si la banca cae, apuesta la mitad para proteger el dinero
     guard = 0.5 if br < peak * (1 - CFG.get("drawdown_guard", 0.15)) else 1.0
+    
     with conn() as c:
         for t in picked:
             dup = c.execute("SELECT 1 FROM picks WHERE event_id=? AND market=? AND outcome=? "
@@ -168,19 +222,22 @@ def cmd_decide(notify_out=True):
                             (t["event"], t["market"], t["outcome"])).fetchone()
             if dup: 
                 continue
+                
             if CFG.get("staking_mode", "flat") == "flat":
                 st = flat(br, CFG.get("flat_pct", 0.01) * guard)
             else:
-                st = kelly(t["p"], t["price"], br, CFG["kelly_fraction"] * guard,
-                           CFG["max_stake_pct"])
+                st = kelly(t["p"], t["price"], br, CFG.get("kelly_fraction", 0.18) * guard,
+                           CFG.get("max_stake_pct", 0.02))
             if st <= 0: continue
-            conf = "ALTA" if t["edge"] >= CFG["min_price_beat"] * 2 else "MEDIA"
+            
+            conf = "ALTA" if t["edge"] >= base_need * 2 else "MEDIA"
             cur = c.execute(
                 "INSERT INTO picks(event_id,market,outcome,book,price,model_prob,fair_prob,"
                 "edge,stake,confidence,status,ts) VALUES (?,?,?,?,?,?,?,?,?,?,'PENDIENTE',?)",
                 (t["event"], t["market"], t["outcome"], t["book"], t["price"], t["p"],
                  t["p"], t["edge"], st, conf, time.time()))
             saved.append((cur.lastrowid, t, st))
+            
     if saved and notify_out:
         notify(fmt(saved))
     print(f"{len(saved)} picks guardados de {len(found)} candidatos")
@@ -211,7 +268,8 @@ def cmd_auto():
     init()
     lead = CFG["scan_lead_minutes"] * 60
     cool = CFG["rescan_cooldown"] * 60
-    print(f"Auto T-{CFG['scan_lead_minutes']}min")
+    print(f"Auto T-{CFG['scan_lead_minutes']}min (Versión Optimizada)")
+    
     while True:
         now = time.time()
         with conn() as c:
@@ -219,23 +277,39 @@ def cmd_auto():
                 "SELECT e.id, e.sport FROM events e WHERE e.commence_ts BETWEEN ? AND ? "
                 "AND NOT EXISTS (SELECT 1 FROM scans s WHERE s.event_id=e.id AND s.ts > ?)",
                 (now + lead - 900, now + lead + 900, now - cool)).fetchall()
-        for r in rows:
+                
+        sports_to_fetch = list(set(r["sport"] for r in rows))
+        valid_ids = set(r["id"] for r in rows)
+        
+        for sport in sports_to_fetch:
             mk = CFG.get("event_markets", "h2h")
-            extra = CFG.get("props_by_sport", {}).get(r["sport"])
+            extra = CFG.get("props_by_sport", {}).get(sport)
             if extra: mk = f"{mk},{extra}"
-            ev = fetch_event_odds(CFG["api_key"], r["sport"], r["id"], CFG["regions"], mk)
-            if ev:
-                g = group([ev])
-                with conn() as c:
-                    for m, bs in g[r["id"]].items():
+            
+            evs, _ = fetch_odds(CFG["api_key"], sport, CFG["regions"], mk)
+            if not evs: continue
+            
+            relevant = [e for e in evs if e["id"] in valid_ids]
+            if not relevant: continue
+            
+            g = group(relevant)
+            with conn() as c:
+                for ev in relevant:
+                    eid = ev["id"]
+                    if eid not in g: continue
+                    for m, bs in g[eid].items():
                         for bk, outs in bs.items():
                             for oc, pr in outs.items():
                                 c.execute("INSERT INTO snaps(event_id,market,book,outcome,price,ts) "
-                                          "VALUES (?,?,?,?,?,?)", (r["id"], m, bk, oc, pr, time.time()))
-                    c.execute("INSERT INTO scans(event_id, ts) VALUES (?,?)", (r["id"], time.time()))
+                                          "VALUES (?,?,?,?,?,?)", (eid, m, bk, oc, pr, time.time()))
+                    c.execute("INSERT INTO scans(event_id, ts) VALUES (?,?)", (eid, time.time()))
+                    
         cmd_decide()
         capture_closing()
-        time.sleep(300)
+        cmd_grade()        # Califica los picks de ayer
+        from db import clean_garbage
+        clean_garbage()    # Limpia la base de datos
+        time.sleep(300)    # Duerme 5 minutos
 
 def capture_closing():
     now = time.time()
@@ -353,6 +427,42 @@ def cmd_settle(pid, res):
         c.execute("UPDATE picks SET status='CERRADO', result=? WHERE id=?", (res, pid))
     print(f"{pid} -> {res}")
 
+def cmd_grade():
+    """Busca resultados de partidos ya terminados y califica los picks automáticamente."""
+    init()
+    now = time.time()
+    # Busca picks pendientes de partidos que empezaron hace más de 4 horas
+    with conn() as c:
+        rows = c.execute("SELECT p.id, p.event_id, p.outcome, p.market, e.sport FROM picks p "
+                         "JOIN events e ON e.id=p.event_id WHERE p.status='PENDIENTE' "
+                         "AND e.commence_ts < ?", (now - 14400,)).fetchall()
+    if not rows: return
+    
+    sports = set(r["sport"] for r in rows)
+    for sport in sports:
+        r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport}/scores/",
+                         params={"apiKey": CFG["api_key"], "daysFrom": 3})
+        if r.status_code != 200: continue
+        
+        scores = {e["id"]: e for e in r.json() if e.get("completed")}
+        
+        for row in rows:
+            if row["sport"] != sport or row["event_id"] not in scores: continue
+            match = scores[row["event_id"]]
+            
+            # Lógica para H2H (Ganador directo)
+            if row["market"] == "h2h" and match.get("scores"):
+                s1, s2 = match["scores"][0], match["scores"][1]
+                v1, v2 = int(s1["score"]), int(s2["score"])
+                
+                ganador = s1["name"] if v1 > v2 else (s2["name"] if v2 > v1 else "Empate")
+                resultado = "win" if row["outcome"] == ganador else "loss"
+                
+                with conn() as c:
+                    c.execute("UPDATE picks SET status='CERRADO', result=? WHERE id=?", 
+                              (resultado, row["id"]))
+                print(f"✅ Pick {row['id']} auto-calificado como {resultado} ({v1}-{v2})")
+
 def cmd_stats():
     with conn() as c:
         rows = c.execute("SELECT stake, price, result, clv FROM picks WHERE status='CERRADO'").fetchall()
@@ -384,7 +494,8 @@ if __name__ == "__main__":
         elif cmd == "reset": cmd_reset()
         elif cmd == "settle": cmd_settle(sys.argv[2], sys.argv[3])
         elif cmd == "books": cmd_books()
+        elif cmd == "grade": cmd_grade()
         elif cmd == "stats": cmd_stats()
-        else: print("sports|discover|collect|decide|scan|auto|funnel|picks|why|reset|settle|stats")
+        else: print("sports|discover|collect|decide|scan|auto|funnel|picks|why|reset|settle|grade|stats")
     except KeyboardInterrupt:
         print("\nDetenido.")
